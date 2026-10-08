@@ -1,0 +1,1 @@
+"""Campus Action demo backend."""
