@@ -2,7 +2,9 @@
 from copy import deepcopy
 from hashlib import sha256
 
-SCHOOL = "hanyang_demo"
+from .school_catalog_学校目录 import ERICA, SEOUL
+
+SCHOOL = SEOUL
 SCHOOL_NAME = "Hanyang University / 한양대학교 / 汉阳大学"
 DEMO_TIME = "2026-10-07T10:00:00+09:00"
 
@@ -16,6 +18,7 @@ ACCOUNTS = [
     {"id": "B", "role": "student", "school_id": SCHOOL, "label": bi("학생 B · 경영 석사", "学生 B · 商科硕士")},
     {"id": "C", "role": "student", "school_id": SCHOOL, "label": bi("학생 C · 정보 미입력", "学生 C · 信息待补充")},
     {"id": "staff", "role": "staff", "school_id": SCHOOL, "label": bi("국제교류처 담당자", "国际交流处工作人员")},
+    {"id": "erica_staff", "role": "staff", "school_id": ERICA, "label": bi("ERICA 국제팀 담당자", "ERICA 国际处工作人员")},
     {"id": "other_staff", "role": "staff", "school_id": "other_demo", "label": bi("타교 담당자 · 접근 검증", "其他学校工作人员 · 访问验证")},
 ]
 

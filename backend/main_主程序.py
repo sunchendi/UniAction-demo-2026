@@ -1,22 +1,30 @@
 """Local-only competition prototype; preset demo identities are not school SSO."""
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
+from .campus_places_办事地点 import task_place_details
 from .extractors_提取器 import ExtractionError, extractor_for
 from .fixtures_演示案例 import ACCOUNTS, DEMO_TIME, SCHOOL, SCHOOL_NAME, all_sources, bi
-from .models_数据模型 import CaseCreate, CaseUpdate, ImportRequest, LoginRequest, Notice, Profile, RegisterRequest, SharingUpdate, TaskUpdate
+from .models_数据模型 import ApplicationFollowup, CaseCreate, CaseUpdate, ImportRequest, LoginRequest, Notice, OnboardingProgress, Profile, RegisterRequest, SharingUpdate, StudentNoticeSource, TaskUpdate
+from .onboarding_入学清单 import onboarding_items
 from .rules_规则 import application_state, match_notice
+from .school_catalog_学校目录 import ERICA, SCHOOLS
+from .staff_review_审核提示 import review_checks
 from .store_存储 import Store
+from .student_calendar_我的日历 import student_calendar
+from .student_notices_学生导入 import MAX_EMAIL_BYTES, StudentNoticeError, preview_email_notice, preview_notice, student_notice_draft
+from .today_今日行动 import student_actions
 from .auth_本地认证 import AUTH_WINDOW_SECONDS, DUMMY_PASSWORD_HASH, SESSION_COOKIE, SESSION_PATTERN, SESSION_SECONDS, hash_password, new_session_token, token_hash, verify_password
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -73,7 +81,11 @@ def create_app(db_path=None, clock=None, auth_clock=None):
     @app.exception_handler(RequestValidationError)
     async def safe_validation_errors(request: Request, exc: RequestValidationError):
         if request.url.path.startswith("/api/auth/"):
-            return JSONResponse(status_code=422, content={"detail": {"code": "invalid_auth_fields", "message": "账号字段无效。用户名须为 3–32 位英文、数字或 _.-；注册密码 15–128 字符，显示名 1–50 字符；请选择合法课程、在读状态与院系。", "fields": [str(error["loc"][-1]) for error in exc.errors()]}})
+            message = "请检查用户名和密码。"
+            if request.url.path == "/api/auth/register":
+                message = "账号字段无效。用户名须为 3–32 位英文、数字或 _.-，注册密码须为 10–32 个字符，显示名须为 1–50 个字符。请选择有效的学校、院系、专业、学位类型和在读状态。"
+            fields = [str(error["loc"][-1]) for error in exc.errors() if error["loc"]]
+            return JSONResponse(status_code=422, content={"detail": {"code": "invalid_auth_fields", "message": message, "fields": fields}})
         return JSONResponse(status_code=422, content={"detail": [{"type": error["type"], "loc": error["loc"], "msg": error["msg"]} for error in exc.errors()]})
 
     def now():
@@ -198,6 +210,10 @@ def create_app(db_path=None, clock=None, auth_clock=None):
     def accounts():
         return [{**a, "is_demo": True} for a in ACCOUNTS]
 
+    @app.get("/api/schools")
+    def schools():
+        return SCHOOLS
+
     @app.get("/api/profile")
     def profile(user=Depends(student)):
         return store.profile(user["id"]).model_dump()
@@ -206,22 +222,115 @@ def create_app(db_path=None, clock=None, auth_clock=None):
     def update_profile(data: Profile, user=Depends(student)):
         if data.school_id != user["school_id"]:
             raise HTTPException(403, "school_id 由服务端账号确定，不允许跨学校修改")
-        store.save_profile(user["id"], data)
+        try:
+            store.save_profile(user["id"], data)
+        except ValueError as exc:
+            raise HTTPException(422, {"code": "invalid_academic_selection", "message": "请选择该校区下有效的院系和专业。"}) from exc
         return data.model_dump()
+
+    @app.get("/api/today")
+    def today(user=Depends(student)):
+        return student_actions(store, user["id"], user["school_id"], now())
+
+    @app.get("/api/calendar")
+    def calendar(month: str | None = Query(default=None, pattern=r"^[0-9]{4}-[0-9]{2}$"), user=Depends(student)):
+        today = now().date()
+        selected_month = month if month is not None else today.isoformat()[:7]
+        try:
+            date.fromisoformat(selected_month + "-01")
+        except ValueError as exc:
+            raise HTTPException(422, "请输入有效的日历月份。") from exc
+        return student_calendar(store, user["id"], user["school_id"], today, selected_month)
+
+    @app.get("/api/onboarding")
+    def onboarding(user=Depends(student)):
+        with store.connection() as db:
+            db.execute("BEGIN")
+            profile = store.profile(user["id"], db)
+            items = onboarding_items(user["school_id"], profile.program_type, demo=user["is_demo"])
+            completed = store.completed_onboarding(user["id"], db)
+        return {
+            "program_type": profile.program_type,
+            "items": [{**item, "completed": item["id"] in completed} for item in items],
+        }
+
+    @app.put("/api/onboarding/{item_id}")
+    def update_onboarding(item_id: str, data: OnboardingProgress, user=Depends(student)):
+        with store.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            profile = store.profile(user["id"], db)
+            items = onboarding_items(user["school_id"], profile.program_type, demo=user["is_demo"])
+            if not any(item["id"] == item_id for item in items):
+                raise HTTPException(404, "入学事项不存在或不适用于当前课程")
+            store.set_onboarding_completed(user["id"], item_id, data.completed, db)
+        return {"id": item_id, "completed": data.completed}
+
+    @app.post("/api/student-notices/preview")
+    def preview_student_notice(data: StudentNoticeSource, user=Depends(student)):
+        try:
+            return preview_notice(data.source_text, data.source_url.strip())
+        except StudentNoticeError as exc:
+            raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
+
+    @app.post("/api/student-notices/preview-email")
+    async def preview_student_email(request: Request, user=Depends(student)):
+        raw = bytearray()
+        async for chunk in request.stream():
+            if len(chunk) + len(raw) > MAX_EMAIL_BYTES:
+                raise HTTPException(413, {"code": "student_email_too_large", "message": "请选择 2 MB 以内的 .eml 文件。"})
+            raw.extend(chunk)
+        try:
+            return await run_in_threadpool(preview_email_notice, bytes(raw))
+        except StudentNoticeError as exc:
+            raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
+
+    @app.post("/api/student-notices")
+    def submit_student_notice(data: StudentNoticeSource, user=Depends(student)):
+        try:
+            draft = student_notice_draft(data.source_text, data.source_url.strip(), user["school_id"])
+        except StudentNoticeError as exc:
+            raise HTTPException(422, {"code": exc.code, "message": str(exc)}) from exc
+        with store.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = store.notice(draft.id, user["school_id"], db=db)
+            if existing is None:
+                store.save_notice(draft, db)
+        return {
+            "notice_id": draft.id,
+            "publication_status": (existing or draft).publication_status,
+        }
 
     @app.get("/api/notices")
     def notices(user=Depends(account)):
-        profile = store.profile(user["id"]) if user["role"] == "student" else None
+        is_staff = user["role"] == "staff"
+        with store.connection() as db:
+            db.execute("BEGIN")
+            profile = store.profile(user["id"], db) if not is_staff else None
+            notices = store.list_notices(user["school_id"], staff=is_staff, db=db)
+        checks = review_checks(notices) if is_staff else {}
         result = []
-        for notice in store.list_notices(user["school_id"], user["role"] == "staff"):
-            result.append({"id": notice.id, "title": notice.title.model_dump(), "category": notice.category, "version": notice.version, "publication_status": notice.publication_status, "official_deadline": notice.official_deadline, "extraction_mode": notice.extraction_mode, "match": match_notice(notice, profile) if profile else None, "application_state": application_state(notice, now()), "change_summary": notice.change_summary.model_dump()})
+        for notice in notices:
+            summary = {"id": notice.id, "title": notice.title.model_dump(), "category": notice.category, "version": notice.version, "publication_status": notice.publication_status, "official_deadline": notice.official_deadline, "extraction_mode": notice.extraction_mode, "match": match_notice(notice, profile) if profile else None, "application_state": application_state(notice, now()), "change_summary": notice.change_summary.model_dump()}
+            if notice.id in checks:
+                summary["review_checks"] = checks[notice.id]
+            result.append(summary)
         return result
 
     @app.get("/api/notices/{id}")
     def notice_detail(id: str, user=Depends(account)):
         notice = get_notice(id, user)
         is_student = user["role"] == "student"
-        return {"notice": notice.model_dump(), "match": match_notice(notice, store.profile(user["id"])) if is_student else None, "tasks": store.tasks(user["id"], id) if is_student else [], "versions": version_summaries(id, user), "application_state": application_state(notice, now()), "submission_status": store.submission(user["id"], id) if is_student else None, "sharing_scope": store.sharing(user["id"], id) if is_student else "none"}
+        tasks, task_places = task_place_details(notice, store.tasks(user["id"], id)) if is_student else ([], {})
+        return {
+            "notice": notice.model_dump(),
+            "match": match_notice(notice, store.profile(user["id"])) if is_student else None,
+            "tasks": tasks,
+            "task_places": task_places,
+            "versions": version_summaries(id, user),
+            "application_state": application_state(notice, now()),
+            "submission_status": store.submission(user["id"], id) if is_student else None,
+            "sharing_scope": store.sharing(user["id"], id) if is_student else "none",
+        }
 
     @app.get("/api/notices/{id}/versions")
     def versions(id: str, user=Depends(account)):
@@ -259,6 +368,35 @@ def create_app(db_path=None, clock=None, auth_clock=None):
         notice = get_notice(id, user)
         return store.submit(user["id"], id, notice.version, now())
 
+    @app.get("/api/applications")
+    def applications(user=Depends(student)):
+        items = []
+        with store.connection() as db:
+            db.execute("BEGIN")
+            records = store.application_records(user["id"], db)
+            for notice in store.list_notices(user["school_id"], db=db):
+                if notice.id not in records:
+                    continue
+                submission, followup = records[notice.id]
+                items.append({
+                    "notice_id": notice.id,
+                    "title": notice.title.model_dump(),
+                    "latest_version": notice.version,
+                    "submitted_version": submission["notice_version"],
+                    "reported_at": submission["reported_at"],
+                    "followup": followup or {"status": "waiting_result", "next_check_on": None, "note": ""},
+                })
+        return {"today": now().date().isoformat(), "items": items}
+
+    @app.put("/api/applications/{id}/follow-up")
+    def application_followup(id: str, data: ApplicationFollowup, user=Depends(student)):
+        get_notice(id, user)
+        followup = data.model_dump()
+        followup["note"] = data.note.strip()
+        if not store.save_application_followup(user["id"], id, followup):
+            raise HTTPException(409, "请先记录本人已提交此申请。")
+        return followup
+
     @app.put("/api/notices/{id}/sharing")
     def sharing(id: str, data: SharingUpdate, user=Depends(student)):
         get_notice(id, user)
@@ -292,6 +430,8 @@ def create_app(db_path=None, clock=None, auth_clock=None):
 
     @app.get("/api/demo/sources")
     def demo_sources(user=Depends(staff)):
+        if user["school_id"] == ERICA:
+            return []
         if user["school_id"] != SCHOOL:
             raise HTTPException(403, "此学校无演示通知资源")
         return all_sources()

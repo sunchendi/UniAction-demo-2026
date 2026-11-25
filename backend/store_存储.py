@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from .fixtures_演示案例 import BASE_NOTICES, DEMO_TIME, PROFILES, SCHOOL, bi
+from .fixtures_演示案例 import BASE_NOTICES, DEMO_TIME, PROFILES, bi
+from .school_catalog_学校目录 import academic_department
 from .models_数据模型 import Notice, Profile
 from .school_migration_学校更名迁移 import migrate_school
 
@@ -22,11 +23,17 @@ class Store:
         with self.connection() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY, school_id TEXT NOT NULL, data TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS onboarding_progress (student_id TEXT NOT NULL REFERENCES profiles(id) ON DELETE CASCADE, item_id TEXT NOT NULL, PRIMARY KEY(student_id,item_id));
                 CREATE TABLE IF NOT EXISTS notices (id TEXT NOT NULL, version INTEGER NOT NULL, school_id TEXT NOT NULL, publication_status TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(school_id,id,version));
                 CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, student_id TEXT NOT NULL, notice_id TEXT NOT NULL, template_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(student_id,notice_id,template_id));
                 CREATE TABLE IF NOT EXISTS sharing (student_id TEXT NOT NULL, notice_id TEXT NOT NULL, scope TEXT NOT NULL, PRIMARY KEY(student_id,notice_id));
                 CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, student_id TEXT NOT NULL, school_id TEXT NOT NULL, notice_id TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS submissions (student_id TEXT NOT NULL, notice_id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(student_id,notice_id));
+                CREATE TABLE IF NOT EXISTS application_followups (
+                    student_id TEXT NOT NULL, notice_id TEXT NOT NULL, data TEXT NOT NULL,
+                    PRIMARY KEY(student_id,notice_id),
+                    FOREIGN KEY(student_id,notice_id) REFERENCES submissions(student_id,notice_id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS auth_users (id TEXT PRIMARY KEY, username TEXT COLLATE NOCASE NOT NULL UNIQUE, password_hash TEXT NOT NULL, display_name TEXT NOT NULL, school_id TEXT NOT NULL, created_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, student_id TEXT NOT NULL REFERENCES auth_users(id), expires_at REAL NOT NULL, created_at REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS auth_limits (bucket TEXT PRIMARY KEY, window_started REAL NOT NULL, attempts INTEGER NOT NULL);
@@ -80,10 +87,12 @@ class Store:
 
     def register_user(self, data, password_hash, real_time):
         id = "user_" + uuid4().hex
-        profile = Profile(school_id=SCHOOL, program_type=data.program_type, enrollment_status=data.enrollment_status, department_id=data.department_id)
+        department = academic_department(data.school_id, data.college_id, data.major_id)
+        profile = Profile(school_id=data.school_id, program_type=data.program_type, enrollment_status=data.enrollment_status,
+                          department_id=department, college_id=data.college_id, major_id=data.major_id)
         with self.connection() as db:
-            db.execute("INSERT INTO auth_users VALUES (?,?,?,?,?,?)", (id, data.username, password_hash, data.display_name, SCHOOL, real_time))
-            db.execute("INSERT INTO profiles VALUES (?,?,?)", (id, SCHOOL, encode(profile.model_dump())))
+            db.execute("INSERT INTO auth_users VALUES (?,?,?,?,?,?)", (id, data.username, password_hash, data.display_name, data.school_id, real_time))
+            db.execute("INSERT INTO profiles VALUES (?,?,?)", (id, data.school_id, encode(profile.model_dump())))
             row = db.execute("SELECT * FROM auth_users WHERE id=?", (id,)).fetchone()
             return self.account_from_user(row)
 
@@ -145,22 +154,45 @@ class Store:
                 query += " AND publication_status='approved'"
             return [json.loads(row[0]) for row in db.execute(query + " ORDER BY version", (id, school_id))]
 
-    def list_notices(self, school_id, staff=False):
-        with self.connection() as db:
-            query = "SELECT DISTINCT id FROM notices WHERE school_id=?"
-            if not staff:
-                query += " AND publication_status='approved'"
-            ids = [row[0] for row in db.execute(query + " ORDER BY id", (school_id,))]
-            return [self.notice(id, school_id, approved=not staff, db=db) for id in ids]
+    def list_notices(self, school_id, staff=False, db=None):
+        if db is None:
+            with self.connection() as conn:
+                return self.list_notices(school_id, staff, conn)
+        query = "SELECT DISTINCT id FROM notices WHERE school_id=?"
+        if not staff:
+            query += " AND publication_status='approved'"
+        ids = [row[0] for row in db.execute(query + " ORDER BY id", (school_id,))]
+        return [self.notice(id, school_id, approved=not staff, db=db) for id in ids]
 
-    def profile(self, student_id):
-        with self.connection() as db:
-            row = db.execute("SELECT data FROM profiles WHERE id=?", (student_id,)).fetchone()
-            return Profile.model_validate(json.loads(row[0])) if row else None
+    def profile(self, student_id, db=None):
+        if db is None:
+            with self.connection() as conn:
+                return self.profile(student_id, conn)
+        row = db.execute("SELECT data FROM profiles WHERE id=?", (student_id,)).fetchone()
+        return Profile.model_validate(json.loads(row[0])) if row else None
 
     def save_profile(self, id, profile):
+        if profile.college_id is not None or profile.major_id is not None:
+            profile.department_id = academic_department(profile.school_id, profile.college_id, profile.major_id)
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if profile.college_id is None and profile.major_id is None:
+                previous = self.profile(id, db)
+                if previous.college_id is not None:
+                    profile.college_id = previous.college_id
+                    profile.major_id = previous.major_id
+                    profile.department_id = previous.department_id
             db.execute("UPDATE profiles SET data=? WHERE id=? AND school_id=?", (encode(profile.model_dump()), id, profile.school_id))
+
+    def completed_onboarding(self, student_id, db):
+        rows = db.execute("SELECT item_id FROM onboarding_progress WHERE student_id=?", (student_id,))
+        return {row["item_id"] for row in rows}
+
+    def set_onboarding_completed(self, student_id, item_id, completed, db):
+        if completed:
+            db.execute("INSERT INTO onboarding_progress VALUES (?,?) ON CONFLICT(student_id,item_id) DO NOTHING", (student_id, item_id))
+        else:
+            db.execute("DELETE FROM onboarding_progress WHERE student_id=? AND item_id=?", (student_id, item_id))
 
     def tasks(self, student_id, notice_id, db=None):
         if db is None:
@@ -300,13 +332,45 @@ class Store:
             db.execute("UPDATE cases SET data=? WHERE id=?", (encode(case), id))
             return case
 
-    def submission(self, student_id, notice_id):
-        with self.connection() as db:
-            row = db.execute("SELECT data FROM submissions WHERE student_id=? AND notice_id=?", (student_id, notice_id)).fetchone()
-            return json.loads(row[0]) if row else {"status": "not_reported", "school_received": False, "school_approved": False}
+    def submission(self, student_id, notice_id, db=None):
+        if db is None:
+            with self.connection() as conn:
+                return self.submission(student_id, notice_id, conn)
+        row = db.execute("SELECT data FROM submissions WHERE student_id=? AND notice_id=?", (student_id, notice_id)).fetchone()
+        return json.loads(row[0]) if row else {"status": "not_reported", "school_received": False, "school_approved": False}
 
     def submit(self, student_id, notice_id, version, now):
         data = {"status": "self_reported_submitted", "notice_version": version, "reported_at": now.isoformat(), "school_received": False, "school_approved": False}
         with self.connection() as db:
-            db.execute("INSERT OR REPLACE INTO submissions VALUES (?,?,?)", (student_id, notice_id, encode(data)))
+            db.execute("""
+                INSERT INTO submissions VALUES (?,?,?)
+                ON CONFLICT(student_id,notice_id) DO UPDATE SET data=excluded.data
+            """, (student_id, notice_id, encode(data)))
         return data
+
+    def application_records(self, student_id, db):
+        rows = db.execute("""
+            SELECT s.notice_id, s.data AS submission, f.data AS followup
+            FROM submissions AS s
+            LEFT JOIN application_followups AS f
+                ON f.student_id=s.student_id AND f.notice_id=s.notice_id
+            WHERE s.student_id=?
+        """, (student_id,))
+        return {
+            row["notice_id"]: (
+                json.loads(row["submission"]),
+                json.loads(row["followup"]) if row["followup"] else None,
+            )
+            for row in rows
+        }
+
+    def save_application_followup(self, student_id, notice_id, data):
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self.submission(student_id, notice_id, db)["status"] != "self_reported_submitted":
+                return False
+            db.execute("""
+                INSERT INTO application_followups VALUES (?,?,?)
+                ON CONFLICT(student_id,notice_id) DO UPDATE SET data=excluded.data
+            """, (student_id, notice_id, encode(data)))
+        return True

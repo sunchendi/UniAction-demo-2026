@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .school_catalog_学校目录 import academic_department
+
 PROFILE_FIELDS = {
     "school_id", "program_type", "enrollment_status", "year", "semester",
     "department_id", "international_student", "gpa_value", "gpa_scale",
@@ -23,13 +25,19 @@ class Localized(StrictModel):
     zh: str
 
 
+class OnboardingProgress(StrictModel):
+    completed: bool
+
+
 class Profile(StrictModel):
     school_id: str
     program_type: Literal["language", "undergraduate", "master", "doctor"]
     enrollment_status: Literal["enrolled", "leave", "graduated"]
     year: int | None = Field(default=None, ge=1, le=12)
     semester: int | None = Field(default=None, ge=1, le=30)
-    department_id: Literal["engineering", "business", "humanities"]
+    department_id: Literal["engineering", "business", "humanities", "other"]
+    college_id: str | None = Field(default=None, max_length=64)
+    major_id: str | None = Field(default=None, max_length=64)
     international_student: bool | None = None
     gpa_value: float | None = Field(default=None, ge=0, le=10)
     gpa_scale: float | None = Field(default=None, gt=0, le=10)
@@ -43,14 +51,20 @@ class Profile(StrictModel):
             raise ValueError("GPA cannot exceed its scale")
         return self
 
-
 class RegisterRequest(StrictModel):
     username: str = Field(min_length=3, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
-    password: str = Field(min_length=15, max_length=128, repr=False)
+    password: str = Field(min_length=10, max_length=32, repr=False)
     display_name: str = Field(min_length=1, max_length=50)
     program_type: Literal["language", "undergraduate", "master", "doctor"]
     enrollment_status: Literal["enrolled", "leave", "graduated"]
-    department_id: Literal["engineering", "business", "humanities"]
+    school_id: str = Field(min_length=1, max_length=64)
+    college_id: str = Field(min_length=1, max_length=64)
+    major_id: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def check_academic_selection(self):
+        academic_department(self.school_id, self.college_id, self.major_id)
+        return self
 
     @field_validator("username")
     @classmethod
@@ -308,3 +322,19 @@ class ImportRequest(StrictModel):
     source_url: str = Field(default="https://demo.invalid/source", max_length=1000)
     mode: Literal["demo", "real"] = "demo"
     notice_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,64}$")
+
+
+class ApplicationFollowup(StrictModel):
+    status: Literal["waiting_result", "needs_documents", "result_checked"]
+    next_check_on: str | None = Field(default=None, pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+    note: str = Field(default="", max_length=1000)
+
+    @field_validator("next_check_on")
+    @classmethod
+    def valid_check_date(cls, value: str | None) -> str | None:
+        return date.fromisoformat(value).isoformat() if value is not None else None
+
+
+class StudentNoticeSource(StrictModel):
+    source_text: str = Field(default="", max_length=100000)
+    source_url: str = Field(default="", max_length=2000)

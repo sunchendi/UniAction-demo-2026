@@ -5,16 +5,18 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.auth_本地认证 import PASSWORD_ITERATIONS, SESSION_COOKIE, SESSION_SECONDS, token_hash, verify_password
+from backend.auth_本地认证 import PASSWORD_ITERATIONS, SESSION_COOKIE, SESSION_SECONDS, hash_password, token_hash, verify_password
 from backend.fixtures_演示案例 import BASE_NOTICES, DEMO_TIME, N1_V2, PROFILES, SCHOOL
 from backend.main_主程序 import create_app
+from backend.models_数据模型 import Profile, RegisterRequest
+from backend.school_catalog_学校目录 import ERICA
 
 ORIGIN = {"Origin": "http://testserver"}
 PASSWORD = "Fictional local password 42!"
 
 
 def registration(username="student_one", **updates):
-    body = {"username": username, "password": PASSWORD, "display_name": "自建测试学生", "program_type": "undergraduate", "enrollment_status": "enrolled", "department_id": "engineering"}
+    body = {"username": username, "password": PASSWORD, "display_name": "自建测试学生", "program_type": "undergraduate", "enrollment_status": "enrolled", "school_id": SCHOOL, "college_id": "engineering", "major_id": "computer_software"}
     return {**body, **updates}
 
 
@@ -52,16 +54,17 @@ def test_register_creates_independent_student_cookie_and_null_optional_profile(c
     profile = client.get("/api/profile").json()
     assert profile["school_id"] == SCHOOL
     assert profile["program_type"] == "undergraduate" and profile["enrollment_status"] == "enrolled" and profile["department_id"] == "engineering"
-    assert all(value is None for key, value in profile.items() if key not in {"school_id", "program_type", "enrollment_status", "department_id"})
+    assert (profile["college_id"], profile["major_id"]) == ("engineering", "computer_software")
+    assert all(value is None for key, value in profile.items() if key not in {"school_id", "program_type", "enrollment_status", "department_id", "college_id", "major_id"})
     assert client.get("/api/auth/me").json()["account"] == account
     assert PASSWORD not in result.text and "password_hash" not in result.text
-    assert len(client.get("/api/accounts").json()) == 5  # no public listing of personal usernames
+    assert all(account.get("is_demo") for account in client.get("/api/accounts").json())
 
 
 @pytest.mark.parametrize("updates", [
     {"role": "staff"}, {"school_id": "other_demo"}, {"gpa_value": 3.8},
-    {"program_type": "administrator"}, {"enrollment_status": "unknown"}, {"department_id": "invented_department"},
-    {"department_id": None}, {"display_name": " "}, {"display_name": "x" * 51},
+    {"program_type": "administrator"}, {"enrollment_status": "unknown"}, {"college_id": "invented_college"},
+    {"college_id": None}, {"major_id": "dance"}, {"school_id": ERICA}, {"display_name": " "}, {"display_name": "x" * 51},
 ])
 def test_registration_rejects_privileges_and_invalid_required_fields(client, updates):
     result = client.post("/api/auth/register", json=registration(**updates))
@@ -72,7 +75,7 @@ def test_registration_rejects_privileges_and_invalid_required_fields(client, upd
 
 
 def test_registration_required_selects_have_no_silent_defaults(client):
-    for field in ["program_type", "enrollment_status", "department_id"]:
+    for field in ["program_type", "enrollment_status", "school_id", "college_id", "major_id"]:
         body = registration(); del body[field]
         assert client.post("/api/auth/register", json=body).status_code == 422
 
@@ -81,9 +84,58 @@ def test_username_uniqueness_is_case_insensitive_and_password_policy_not_echoed(
     register(client)
     duplicate = client.post("/api/auth/register", json=registration("STUDENT_ONE"))
     assert duplicate.status_code == 409 and duplicate.json()["detail"]["code"] == "username_taken"
-    short = "TooShort9!"
+    short = "TooShort!"
     invalid = client.post("/api/auth/register", json=registration("another_name", password=short))
     assert invalid.status_code == 422 and short not in invalid.text
+
+
+def test_erica_registration_persists_academic_selection_and_campus_scope(client, environment):
+    schools = client.get("/api/schools").json()
+    assert [school["id"] for school in schools] == [SCHOOL, ERICA]
+    assert all(college["majors"] for school in schools for college in school["colleges"])
+    account = register(client, school_id=ERICA, college_id="software_convergence", major_id="intelligent_cloud")
+    profile = client.get("/api/profile").json()
+    assert profile["school_id"] == account["school_id"] == ERICA
+    assert (profile["college_id"], profile["major_id"], profile["department_id"]) == ("software_convergence", "intelligent_cloud", "engineering")
+    assert client.get("/api/notices").json() == []
+    assert client.get("/api/notices/N1").status_code == 404
+    assert client.put("/api/profile", json={**profile, "school_id": SCHOOL}).status_code == 403
+    assert client.put("/api/profile", json={**profile, "college_id": "design"}).status_code == 422
+    saved = client.put("/api/profile", json={**profile, "college_id": "design", "major_id": "industrial_design"})
+    assert saved.status_code == 200 and saved.json()["department_id"] == "other"
+    older_form = {key: value for key, value in saved.json().items() if key not in {"college_id", "major_id"}}
+    assert client.put("/api/profile", json=older_form).json()["major_id"] == "industrial_design"
+
+    submitted = client.post("/api/student-notices", json={"source_text": "ERICA 交流活动\n报名截止 2026-11-30"})
+    assert submitted.status_code == 200
+    notice = submitted.json()["notice_id"]
+    erica_staff = TestClient(environment[0], headers={**ORIGIN, "X-Demo-Account": "erica_staff"})
+    seoul_staff = TestClient(environment[0], headers={**ORIGIN, "X-Demo-Account": "staff"})
+    assert seoul_staff.get(f"/api/notices/{notice}").status_code == 404
+    assert erica_staff.get(f"/api/notices/{notice}").json()["notice"]["school_id"] == ERICA
+    assert erica_staff.post(f"/api/staff/notices/{notice}/versions/1/review").status_code == 200
+    assert erica_staff.post(f"/api/staff/notices/{notice}/versions/1/approve").status_code == 200
+    assert client.get(f"/api/notices/{notice}").status_code == 200
+
+
+@pytest.mark.parametrize("length,status", [(9, 422), (10, 200), (32, 200), (33, 422)])
+def test_registration_password_length_counts_unicode_characters(client, length, status):
+    password = "Qa9!" + "🚀" * (length - 4)
+    result = client.post("/api/auth/register", json=registration(password=password))
+    assert result.status_code == status
+    assert password not in result.text
+    if status == 422:
+        assert "password" in result.json()["detail"]["fields"]
+
+
+def test_preexisting_long_password_still_logs_in(client, environment):
+    app, _, clock = environment
+    password = "Legacy account password with over 32 characters"
+    fields = RegisterRequest.model_construct(**registration("legacy_account", password=password))
+    account = app.state.store.register_user(fields, hash_password(password), clock["now"].timestamp())
+    response = client.post("/api/auth/login", json={"username": "legacy_account", "password": password})
+    assert response.status_code == 200
+    assert response.json()["account"]["id"] == account["id"]
 
 
 def test_custom_profile_and_session_survive_new_app_instance(environment, client):
@@ -161,7 +213,7 @@ def test_valid_cookie_cannot_be_overridden_by_other_demo_or_staff_header(client)
 def test_two_registered_students_have_separate_profiles_tasks_and_cases(environment, client):
     first = register(client)
     second_client = TestClient(environment[0], headers=ORIGIN)
-    second = register(second_client, username="student_two", display_name="另一学生", program_type="master", department_id="business")
+    second = register(second_client, username="student_two", display_name="另一学生", program_type="master", college_id="business", major_id="business_administration")
     assert first["id"] != second["id"]
     assert client.get("/api/profile").json()["program_type"] == "undergraduate"
     assert second_client.get("/api/profile").json()["program_type"] == "master"
@@ -229,7 +281,7 @@ def test_demo_reset_protects_registered_data_and_existing_demo_progress(environm
     assert len(client.get("/api/notices/N1").json()["tasks"]) == 4
     assert len(client.get("/api/cases").json()) == 1
     assert next(t for t in demo.get("/api/notices/N1").json()["tasks"] if t["template_id"] == "transcript")["status"] == "done"
-    assert demo.get("/api/profile").json() == PROFILES["A"]
+    assert demo.get("/api/profile").json() == Profile.model_validate(PROFILES["A"]).model_dump()
 
 
 @pytest.mark.parametrize("origin", ["https://evil.invalid", "http://localhost:8000.evil.invalid", "null"])
@@ -338,6 +390,9 @@ def test_school_rename_keeps_accounts_sessions_versions_progress_consent_and_ori
                 data = old_value(json.loads(row["data"]))
                 if table == "notices":
                     data["source_hash"] = sha256(data["source_text"].encode("utf-8")).hexdigest()
+                if table == "profiles":
+                    data.pop("college_id", None)
+                    data.pop("major_id", None)
                 db.execute(f"UPDATE {table} SET school_id=?,data=? WHERE rowid=?", (LEGACY_SCHOOL, json.dumps(data, ensure_ascii=False), row["rowid"]))
         for row in db.execute("SELECT id,data FROM tasks WHERE student_id=?", (student,)).fetchall():
             db.execute("UPDATE tasks SET data=? WHERE id=?", (json.dumps(old_value(json.loads(row["data"])), ensure_ascii=False), row["id"]))
@@ -347,7 +402,7 @@ def test_school_rename_keeps_accounts_sessions_versions_progress_consent_and_ori
     restarted = TestClient(restarted_app, headers=ORIGIN)
     restarted.cookies.set(SESSION_COOKIE, saved_cookie)
     assert restarted.get("/api/auth/me").json()["account"] == account
-    assert restarted.get("/api/profile").json() == profile
+    assert restarted.get("/api/profile").json() == Profile.model_validate(profile).model_dump()
     assert restarted.get("/api/notices/N1").json() == expected_detail
     assert restarted.get("/api/cases").json() == expected_cases
     assert restarted_app.state.store.registered_credentials("student_one")["password_hash"] == password_hash

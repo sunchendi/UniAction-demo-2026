@@ -10,7 +10,7 @@ const out=process.env.QA_OUTPUT_DIR ? path.resolve(process.env.QA_OUTPUT_DIR) : 
 if(out)fs.mkdirSync(out,{recursive:true});
 const checks=[];
 const runtimeErrors=[];
-const password='LocalAccountTest!2026'; // Artificial QA password; never a real user credential.
+const password='Qa9!测试🚀xyz'; // Ten characters, including one supplementary Unicode character.
 const first='qa_learner_'+Date.now();
 const second=first+'_b';
 async function check(name,action){await action();checks.push(name);console.log('PASS '+name);}
@@ -22,20 +22,22 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
   const context=await browser.newContext({viewport:{width:1440,height:1000}});
   const page=await context.newPage();
   page.on('pageerror',error=>runtimeErrors.push(error.message));
-  const idle=async()=>{await page.locator('.loading').waitFor({state:'hidden'});await page.getByTestId('notice-N1').waitFor();};
+  const openNotices=async()=>{await page.getByTestId('nav-notices').click();await page.getByTestId('notice-N1').waitFor();};
   const get=async route=>{const response=await page.request.get(base+'/api'+route);return {status:response.status(),data:await response.json()};};
   const shot=async name=>{if(out)await page.screenshot({path:path.join(out,name),fullPage:true});};
-  async function register(username,name,program='undergraduate',department='engineering'){
+  async function register(username,name,program='undergraduate',department='engineering',school='hanyang_demo'){
     await page.getByTestId('auth-register-tab').click();
     await page.getByTestId('auth-username').fill(username);
     await page.getByTestId('auth-password').fill(password);
     await page.getByTestId('auth-display-name').fill(name);
     await page.getByTestId('auth-program').selectOption(program);
     await page.getByTestId('auth-enrollment').selectOption('enrolled');
+    await page.getByTestId('auth-school').selectOption(school);
     await page.getByTestId('auth-department').selectOption(department);
+    await page.getByTestId('auth-major').selectOption({engineering:'computer_software',business:'business_administration',software_convergence:'intelligent_cloud'}[department]);
     await Promise.all([page.waitForResponse(r=>r.url().endsWith('/auth/register')&&r.status()===200),page.getByTestId('auth-submit').click()]);
     await page.getByTestId('save-profile').waitFor();
-    await page.getByTestId('nav-notices').click();await idle();
+    if(school==='hanyang_demo')await openNotices();
   }
   async function logout(){await page.getByTestId('logout').click();await page.getByTestId('auth-login-tab').waitFor();}
   async function login(username,pass=password){
@@ -51,9 +53,45 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       assert.equal(await page.getByTestId('auth-password').getAttribute('type'),'password');
       assert.equal(await page.getByTestId('auth-program').inputValue(),'');
       assert.equal(await page.getByTestId('auth-enrollment').inputValue(),'');
+      assert.equal(await page.getByTestId('auth-school').inputValue(),'');
+      assert(await page.getByTestId('auth-department').isDisabled());
+      assert(await page.getByTestId('auth-major').isDisabled());
       assert.equal(await page.getByTestId('auth-department').inputValue(),'');
       assert.equal(await page.getByTestId('profile-gpa_value').count(),0);
       await shot('01_Registration_个人注册.png');
+      await page.getByTestId('auth-username').fill(first);
+      for(const length of [9,33]){
+        await page.getByTestId('auth-password').fill('🚀'.repeat(length));
+        await page.getByTestId('auth-submit').click();
+        assert.match(await page.getByRole('alert').innerText(),/10–32/);
+      }
+    });
+    await check('School, college and major fields reset and use the selected official campus catalog',async()=>{
+      const school=page.getByTestId('auth-school');
+      const college=page.getByTestId('auth-department');
+      const major=page.getByTestId('auth-major');
+      assert.equal(await school.locator('option:not([disabled])').count(),2);
+      await school.selectOption('hanyang_demo');
+      await college.selectOption('engineering');
+      await major.selectOption('computer_software');
+      await school.selectOption('hanyang_erica');
+      assert.equal(await college.inputValue(),'');
+      assert.equal(await major.inputValue(),'');
+      assert(await major.isDisabled());
+      await college.selectOption('software_convergence');
+      await major.selectOption('intelligent_cloud');
+      await college.selectOption('design');
+      assert.equal(await major.inputValue(),'');
+      assert.equal(await major.locator('option[value="intelligent_cloud"]').count(),0);
+      await major.selectOption('industrial_design');
+      await page.getByTestId('language-select').selectOption('zh');
+      await page.getByRole('heading',{name:'创建个人账号',exact:true}).waitFor();
+      await shot('08_AcademicRegistration_学校院系专业.png');
+      await page.setViewportSize({width:390,height:844});
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      await shot('09_AcademicRegistrationMobile_手机学校院系专业.png');
+      await page.setViewportSize({width:1440,height:1000});
+      await page.getByTestId('language-select').selectOption('ko');
     });
     let accountId;
     await check('Registration creates an independent student and unknown optional fields',async()=>{
@@ -64,6 +102,9 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       assert.equal(me.account.role,'student');
       assert(!['A','B','C','staff'].includes(accountId));
       const profile=(await get('/profile')).data;
+      assert.equal(profile.school_id,'hanyang_demo');
+      assert.equal(profile.college_id,'engineering');
+      assert.equal(profile.major_id,'computer_software');
       for(const field of ['year','semester','international_student','current_dorm_resident','gpa_value','gpa_scale','gpa_period'])assert.equal(profile[field],null);
       assert.equal((await get('/notices/N1')).data.match.status,'missing_information');
       const cookies=await context.cookies();
@@ -86,7 +127,7 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       await page.getByTestId('profile-gpa_scale').fill('4.5');
       await page.getByTestId('profile-gpa_period').selectOption('previous_semester');
       await Promise.all([page.waitForResponse(r=>r.url().endsWith('/profile')&&r.request().method()==='PUT'&&r.status()===200),page.getByTestId('save-profile').click()]);
-      await page.reload();await idle();
+      await page.reload();await page.getByTestId('today-page').waitFor();await openNotices();
       assert.equal((await get('/auth/me')).data.account.id,accountId);
       const profile=(await get('/profile')).data;
       assert.equal(profile.gpa_value,3.8);assert.equal(profile.gpa_scale,4.5);
@@ -101,11 +142,35 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       assert(documentTask);
       await page.getByTestId('task-status-'+documentTask.id).selectOption('done');
       await page.waitForFunction(()=>document.querySelectorAll('.status-done').length>0);
-      await page.reload();await idle();
+      await page.reload();await page.getByTestId('today-page').waitFor();await openNotices();
       const restored=(await get('/notices/N1')).data.tasks;
       assert.equal(restored.find(task=>task.id===documentTask.id).status,'done');
       await page.getByTestId('notice-N1').click();await page.locator('.task-item').first().waitFor();
       await shot('02_PersonalTasks_自定义资料与进度.png');
+    });
+    await check('Onboarding checklist links to official guides and saves reversible progress',async()=>{
+      await page.getByTestId('nav-onboarding').click();
+      const housing=page.getByTestId('onboarding-item-housing');
+      await housing.waitFor();
+      assert.equal(await page.getByTestId('onboarding-page').getByRole('checkbox').count(),7);
+      const housingSteps=housing.locator('.onboarding-details');
+      await housingSteps.locator('summary').click();
+      assert.equal(await housingSteps.getByRole('link').getAttribute('href'),'https://www.dormitory.hanyang.ac.kr/');
+      const wifi=page.getByTestId('onboarding-check-wifi');
+      const saved=()=>page.waitForResponse(response=>response.url().endsWith('/api/onboarding/wifi')&&response.status()===200);
+      await Promise.all([saved(),wifi.click()]);
+      await page.waitForFunction(()=>document.querySelector('[data-testid="onboarding-check-wifi"]')?.checked===true);
+      assert.match(await page.getByTestId('onboarding-progress').innerText(),/1\s*\/\s*7/);
+      await page.reload();
+      await page.getByTestId('nav-onboarding').click();
+      await wifi.waitFor();
+      assert.equal(await wifi.isChecked(),true);
+      await Promise.all([saved(),wifi.click()]);
+      await page.waitForFunction(()=>document.querySelector('[data-testid="onboarding-check-wifi"]')?.checked===false);
+      assert.match(await page.getByTestId('onboarding-progress').innerText(),/0\s*\/\s*7/);
+      await Promise.all([saved(),wifi.click()]);
+      await page.waitForFunction(()=>document.querySelector('[data-testid="onboarding-check-wifi"]')?.checked===true);
+      await shot('04_Onboarding_留学生入学清单.png');
     });
     await check('Cookie identity cannot be replaced by a demo header',async()=>{
       const response=await page.request.get(base+'/api/profile',{headers:{'X-Demo-Account':'B'}});
@@ -118,6 +183,7 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       assert.equal(response.status,409);
       assert.equal((await get('/profile')).data.gpa_value,3.8);
       assert.equal((await get('/notices/N1')).data.tasks.length,4);
+      assert.equal((await get('/onboarding')).data.items.find(item=>item.id==='wifi').completed,true);
     });
     await check('Logout clears the session; two local students remain isolated',async()=>{
       await logout();
@@ -126,10 +192,13 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       assert.notEqual((await get('/auth/me')).data.account.id,accountId);
       assert.equal((await get('/profile')).data.gpa_value,null);
       assert.equal((await get('/notices/N1')).data.tasks.length,0);
+      assert.equal((await get('/today')).data.upcoming.flatMap(notice=>notice.tasks).length,0);
+      assert.equal((await get('/onboarding')).data.items.find(item=>item.id==='wifi').completed,false);
       await logout();
-      await login(first.toUpperCase());await idle();
+      await login(first.toUpperCase());await page.getByTestId('today-page').waitFor();
       assert.equal((await get('/auth/me')).data.account.id,accountId);
       assert.equal((await get('/notices/N1')).data.tasks.length,4);
+      assert.equal((await get('/onboarding')).data.items.find(item=>item.id==='wifi').completed,true);
     });
     await check('Wrong password is a visible failure and does not create a session',async()=>{
       await logout();
@@ -137,17 +206,66 @@ async function ready(){for(let n=0;n<50;n++){try{if((await fetch(base+'/api/heal
       await login(first,'IncorrectPassword!2026');await result;
       assert.equal((await get('/auth/me')).data.account,null);
       assert(await page.locator('.error').count()||await page.getByRole('alert').count());
-      await login(first);await idle();
+      await login(first);await page.getByTestId('today-page').waitFor();
     });
     await check('Chinese mobile local account remains readable',async()=>{
-      const language=page.getByRole('button',{name:'中文로 전환',exact:true});
-      if(await language.count())await language.click();
+      await page.getByTestId('language-select').selectOption('zh');
       await page.setViewportSize({width:390,height:844});
+      await page.getByTestId('nav-onboarding').click();
+      await page.getByTestId('onboarding-check-wifi').waitFor();
+      assert.equal(await page.getByTestId('onboarding-page').getByRole('heading',{level:1}).innerText(),'留学生入学清单');
+      const orientation=page.getByTestId('onboarding-item-orientation').locator('.onboarding-details');
+      await orientation.locator('summary').click();
+      assert.equal(await orientation.getByRole('link').getAttribute('href'),'https://oia.hanyang.ac.kr/notice');
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      await shot('05_OnboardingMobile_中文入学清单.png');
       await page.getByTestId('nav-profile').click();
       assert.equal(await page.locator('html').getAttribute('lang'),'zh-CN');
       const dimensions=await page.evaluate(()=>({viewport:innerWidth,width:document.documentElement.scrollWidth}));
       assert(dimensions.width<=dimensions.viewport);
       await shot('03_Mobile_中文个人资料.png');
+      await openNotices();
+      await page.getByTestId('student-import-open').click();
+      await page.getByTestId('student-import-text').fill('校园活动公告\n截止 2026-11-30 17:00\n申请材料\n- 在学证明');
+      await page.getByTestId('student-import-preview').click();
+      const noticePreview=page.locator('.student-intake-preview');
+      await noticePreview.waitFor();
+      assert.match(await noticePreview.innerText(),/日期候选.*2026-11-30.*材料候选.*在学证明/s);
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      await shot('06_StudentNoticeMobile_移动端公告预览.png');
+      await page.getByTestId('nav-today').click();
+      const dining=page.getByTestId('campus-shortcut-dining');
+      assert.equal(await dining.innerText(),'今日食堂');
+      assert.equal(await dining.getAttribute('href'),'https://fnb.hanyang.ac.kr/front/fnbmMdMenu');
+      assert.equal(await page.getByTestId('campus-shortcut-shuttle').count(),0);
+      await page.getByTestId('calendar-open').click();
+      await page.getByTestId('calendar-month').waitFor();
+      assert.equal(await page.getByTestId('calendar-page').getByRole('heading',{level:1}).innerText(),'我的日历');
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+      await shot('07_CalendarMobile_手机日历.png');
+    });
+    await check('An ERICA account can select and update its own college and major',async()=>{
+      await logout();
+      await register(first+'_erica','QA ERICA 학생','undergraduate','software_convergence','hanyang_erica');
+      assert.match(await page.getByTestId('workspace-school').innerText(),/ERICA/);
+      assert.match(await page.getByTestId('profile-school').inputValue(),/ERICA/);
+      assert.equal(await page.getByTestId('profile-department').inputValue(),'software_convergence');
+      assert.equal(await page.getByTestId('profile-major').inputValue(),'intelligent_cloud');
+      assert.equal((await get('/notices/N1')).status,404);
+      await page.getByTestId('profile-department').selectOption('design');
+      assert.equal(await page.getByTestId('profile-major').inputValue(),'');
+      assert(await page.getByTestId('save-profile').isDisabled());
+      await page.getByTestId('profile-major').selectOption('industrial_design');
+      await Promise.all([page.waitForResponse(r=>r.url().endsWith('/api/profile')&&r.request().method()==='PUT'&&r.ok()),page.getByTestId('save-profile').click()]);
+      assert.equal((await get('/profile')).data.major_id,'industrial_design');
+      await page.getByTestId('nav-today').click();
+      const dining=page.getByTestId('campus-shortcut-dining');
+      const shuttle=page.getByTestId('campus-shortcut-shuttle');
+      assert.equal(await dining.innerText(),'今日食堂');
+      assert.equal(await dining.getAttribute('href'),'https://life.hanyang.ac.kr/theme/pages/home.php');
+      assert.equal(await shuttle.innerText(),'校车时刻表');
+      assert.equal(await shuttle.getAttribute('href'),'https://hybus.app/');
+      assert.equal(await page.getByTestId('campus-shortcut-map').getAttribute('href'),'https://www.hanyang.ac.kr/map_erica');
     });
     assert.equal(runtimeErrors.length,0);
     const result={checked_at:new Date().toISOString(),result:'PASS',checks,groups:checks.length,browser_runtime_errors:runtimeErrors.length,scope:'Artificial QA accounts in a temporary local database. Not production, SSO or school verification.'};
